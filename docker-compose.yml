@@ -1,0 +1,25 @@
+
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: zeroguard-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+  mongodb:
+    image: mongo:7.0
+    container_name: zeroguard-mongo
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: zeroguard_db
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  redis-data:
+  mongo-data:
