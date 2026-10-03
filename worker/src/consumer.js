@@ -1,205 +1,102 @@
 require('dotenv').config();
-
 const { Worker } = require('bullmq');
 const mongoose = require('mongoose');
-
 const AuditLedger = require('./ledger/AuditLedger');
 
-// ======================================================
-// Environment Validation
-// ======================================================
+/**
+ * Configure Redis connection for BullMQ.
+ * Handles full URIs (rediss://...) as well as host/port/password parameters.
+ */
+function buildRedisConnection() {
+  // Option A: If REDIS_URL is provided (e.g., Upstash full connection string)
+  if (process.env.REDIS_URL) {
+    let redisUrl = process.env.REDIS_URL.trim();
+    
+    // Convert ioredis/rediss syntax for BullMQ parser compatibility
+    if (redisUrl.startsWith('rediss://')) {
+      return {
+        url: redisUrl,
+        tls: { rejectUnauthorized: false }
+      };
+    }
+    return { url: redisUrl };
+  }
 
-const MONGO_URI = process.env.MONGO_URI;
+  // Option B: If discrete host, port, password parameters are used
+  // Clean host parameter in case protocol prefix was accidentally passed
+  let host = (process.env.REDIS_HOST || '127.0.0.1')
+    .replace(/^rediss?:\/\//, '')
+    .split('@')
+    .pop()
+    .split(':')[0];
 
-if (!MONGO_URI) {
-  console.error(
-    '[ZeroGuard Worker] ERROR: MONGO_URI environment variable is not set.'
-  );
+  const config = {
+    host,
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    password: process.env.REDIS_PASSWORD || undefined,
+    maxRetriesPerRequest: null // Required by BullMQ
+  };
 
-  process.exit(1);
+  // Upstash cloud requires TLS/SSL enabled
+  if (process.env.REDIS_TLS === 'true' || host.includes('upstash.io')) {
+    config.tls = { rejectUnauthorized: false };
+  }
+
+  return config;
 }
 
-// ======================================================
-// Redis Configuration
-// ======================================================
-
-const REDIS_CONFIG = {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-
-  port: Number(process.env.REDIS_PORT) || 6379,
-
-  password:
-    process.env.REDIS_PASSWORD || undefined,
-
-  tls:
-    process.env.REDIS_TLS === 'true'
-      ? {}
-      : undefined,
-};
-
-// ======================================================
-// Main Worker
-// ======================================================
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/zeroguard_db';
 
 async function main() {
+  console.log('[ZeroGuard Worker] Initializing worker service...');
+
+  // 1. Connect to MongoDB Ledger Database
   try {
-    // ==================================================
-    // MongoDB Connection
-    // ==================================================
-
-    console.log(
-      '[ZeroGuard Worker] Connecting to MongoDB...'
-    );
-
-    await mongoose.connect(MONGO_URI, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-    });
-
-    console.log(
-      '[ZeroGuard Worker] Connected to MongoDB cloud ledger.'
-    );
-
-    // ==================================================
-    // BullMQ Audit Worker
-    // ==================================================
-
-    const auditWorker = new Worker(
-      'audit-events',
-
-      async (job) => {
-        try {
-          const eventData = job.data;
-
-          console.log(
-            `[Processing Audit Job] Job #${job.id}`
-          );
-
-          const savedRecord =
-            await AuditLedger.appendEntry(
-              eventData
-            );
-
-          console.log(
-            `[Ledger Appended] Seq #${savedRecord.sequenceId} | Hash: ${savedRecord.currentHash.substring(0, 12)}...`
-          );
-
-          return {
-            status: 'persisted',
-
-            sequenceId:
-              savedRecord.sequenceId,
-          };
-        } catch (err) {
-          console.error(
-            `[Audit Job Processing Error] Job #${job.id}:`,
-            err
-          );
-
-          throw err;
-        }
-      },
-
-      {
-        connection: REDIS_CONFIG,
-
-        // Optional BullMQ worker settings
-        concurrency: 5,
-      }
-    );
-
-    // ==================================================
-    // Worker Events
-    // ==================================================
-
-    auditWorker.on(
-      'ready',
-      () => {
-        console.log(
-          '[ZeroGuard Worker] BullMQ worker is ready.'
-        );
-      }
-    );
-
-    auditWorker.on(
-      'completed',
-      (job) => {
-        console.log(
-          `[Worker Job Completed] Job #${job.id}`
-        );
-      }
-    );
-
-    auditWorker.on(
-      'failed',
-      (job, err) => {
-        console.error(
-          `[Worker Job Error] Job #${job?.id}:`,
-          err
-        );
-      }
-    );
-
-    auditWorker.on(
-      'error',
-      (err) => {
-        console.error(
-          '[ZeroGuard Worker] BullMQ error:',
-          err
-        );
-      }
-    );
-
-    // ==================================================
-    // Graceful Shutdown
-    // ==================================================
-
-    const shutdown = async (signal) => {
-      console.log(
-        `[ZeroGuard Worker] Received ${signal}. Shutting down...`
-      );
-
-      try {
-        await auditWorker.close();
-
-        await mongoose.connection.close();
-
-        console.log(
-          '[ZeroGuard Worker] Shutdown completed.'
-        );
-
-        process.exit(0);
-      } catch (err) {
-        console.error(
-          '[ZeroGuard Worker] Shutdown error:',
-          err
-        );
-
-        process.exit(1);
-      }
-    };
-
-    process.on(
-      'SIGTERM',
-      () => shutdown('SIGTERM')
-    );
-
-    process.on(
-      'SIGINT',
-      () => shutdown('SIGINT')
-    );
+    await mongoose.connect(MONGO_URI);
+    console.log('[ZeroGuard Worker] Successfully connected to MongoDB cloud ledger.');
   } catch (err) {
-    console.error(
-      '[ZeroGuard Worker] Startup failed:',
-      err
-    );
-
+    console.error('[ZeroGuard Worker] MongoDB Connection Error:', err);
     process.exit(1);
   }
+
+  const connectionConfig = buildRedisConnection();
+
+  // 2. Initialize BullMQ Worker Consumer on the 'audit-events' queue
+  const auditWorker = new Worker(
+    'audit-events',
+    async (job) => {
+      const eventData = job.data;
+
+      // Append record to SHA-256 block-chained ledger
+      const savedRecord = await AuditLedger.appendEntry(eventData);
+
+      console.log(
+        `[Ledger Appended] Seq #${savedRecord.sequenceId} | Hash: ${savedRecord.currentHash.substring(0, 12)}... | Action: ${savedRecord.action}`
+      );
+
+      return { status: 'persisted', sequenceId: savedRecord.sequenceId };
+    },
+    { connection: connectionConfig }
+  );
+
+  auditWorker.on('ready', () => {
+    console.log('[ZeroGuard Worker] BullMQ Consumer is connected and listening for audit events.');
+  });
+
+  auditWorker.on('completed', (job) => {
+    // Processed successfully
+  });
+
+  auditWorker.on('failed', (job, err) => {
+    console.error(`[ZeroGuard Worker] Job #${job?.id} processing failed:`, err.message);
+  });
+
+  auditWorker.on('error', (err) => {
+    console.error('[ZeroGuard Worker] BullMQ Engine Error:', err.message);
+  });
 }
 
-// ======================================================
-// Start
-// ======================================================
-
-main();
+main().catch((err) => {
+  console.error('[ZeroGuard Worker] Fatal Execution Error:', err);
+  process.exit(1);
+});
