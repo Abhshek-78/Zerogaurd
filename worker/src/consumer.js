@@ -1,18 +1,12 @@
 require('dotenv').config();
+const http = require('http'); // 1. Import http
 const { Worker } = require('bullmq');
 const mongoose = require('mongoose');
 const AuditLedger = require('./ledger/AuditLedger');
 
-/**
- * Configure Redis connection for BullMQ.
- * Handles full URIs (rediss://...) as well as host/port/password parameters.
- */
 function buildRedisConnection() {
-  // Option A: If REDIS_URL is provided (e.g., Upstash full connection string)
   if (process.env.REDIS_URL) {
     let redisUrl = process.env.REDIS_URL.trim();
-    
-    // Convert ioredis/rediss syntax for BullMQ parser compatibility
     if (redisUrl.startsWith('rediss://')) {
       return {
         url: redisUrl,
@@ -22,8 +16,6 @@ function buildRedisConnection() {
     return { url: redisUrl };
   }
 
-  // Option B: If discrete host, port, password parameters are used
-  // Clean host parameter in case protocol prefix was accidentally passed
   let host = (process.env.REDIS_HOST || '127.0.0.1')
     .replace(/^rediss?:\/\//, '')
     .split('@')
@@ -34,10 +26,9 @@ function buildRedisConnection() {
     host,
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
     password: process.env.REDIS_PASSWORD || undefined,
-    maxRetriesPerRequest: null // Required by BullMQ
+    maxRetriesPerRequest: null
   };
 
-  // Upstash cloud requires TLS/SSL enabled
   if (process.env.REDIS_TLS === 'true' || host.includes('upstash.io')) {
     config.tls = { rejectUnauthorized: false };
   }
@@ -50,7 +41,6 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/zeroguard_
 async function main() {
   console.log('[ZeroGuard Worker] Initializing worker service...');
 
-  // 1. Connect to MongoDB Ledger Database
   try {
     await mongoose.connect(MONGO_URI);
     console.log('[ZeroGuard Worker] Successfully connected to MongoDB cloud ledger.');
@@ -61,19 +51,14 @@ async function main() {
 
   const connectionConfig = buildRedisConnection();
 
-  // 2. Initialize BullMQ Worker Consumer on the 'audit-events' queue
   const auditWorker = new Worker(
     'audit-events',
     async (job) => {
       const eventData = job.data;
-
-      // Append record to SHA-256 block-chained ledger
       const savedRecord = await AuditLedger.appendEntry(eventData);
-
       console.log(
         `[Ledger Appended] Seq #${savedRecord.sequenceId} | Hash: ${savedRecord.currentHash.substring(0, 12)}... | Action: ${savedRecord.action}`
       );
-
       return { status: 'persisted', sequenceId: savedRecord.sequenceId };
     },
     { connection: connectionConfig }
@@ -83,16 +68,25 @@ async function main() {
     console.log('[ZeroGuard Worker] BullMQ Consumer is connected and listening for audit events.');
   });
 
-  auditWorker.on('completed', (job) => {
-    // Processed successfully
-  });
-
   auditWorker.on('failed', (job, err) => {
     console.error(`[ZeroGuard Worker] Job #${job?.id} processing failed:`, err.message);
   });
 
   auditWorker.on('error', (err) => {
     console.error('[ZeroGuard Worker] BullMQ Engine Error:', err.message);
+  });
+
+  // -------------------------------------------------------------
+  // DUMMY HEALTH-CHECK HTTP SERVER FOR RENDER PORT SCAN
+  // -------------------------------------------------------------
+  const PORT = process.env.PORT || 10000;
+  const healthServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'healthy', service: 'zeroguard-worker' }));
+  });
+
+  healthServer.listen(PORT, () => {
+    console.log(`[ZeroGuard Worker] Health check endpoint listening on port ${PORT}`);
   });
 }
 
