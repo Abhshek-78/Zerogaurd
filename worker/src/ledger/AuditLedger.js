@@ -14,11 +14,36 @@ const AuditSchema = new mongoose.Schema({
   currentHash: { type: String, required: true }
 });
 
+const GENESIS_HASH = '0'.repeat(64);
+
+function canonicalize(value) {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = canonicalize(value[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
 /**
  * Computes a deterministic SHA-256 hash for an audit log record
  */
 AuditSchema.statics.calculateHash = function (data, previousHash) {
-  const payloadString = `${data.sequenceId}|${data.timestamp}|${data.clientIp}|${data.method}|${data.url}|${data.statusCode}|${data.action}|${previousHash}`;
+  const payloadString = JSON.stringify(canonicalize({
+    sequenceId: data.sequenceId,
+    timestamp: data.timestamp,
+    clientIp: data.clientIp,
+    method: data.method,
+    url: data.url,
+    statusCode: data.statusCode,
+    action: data.action,
+    threatDetails: data.threatDetails ?? null,
+    previousHash
+  }));
   return crypto.createHash('sha256').update(payloadString).digest('hex');
 };
 
@@ -30,7 +55,7 @@ AuditSchema.statics.appendEntry = async function (eventData) {
   const lastEntry = await this.findOne().sort({ sequenceId: -1 }).exec();
 
   const sequenceId = lastEntry ? lastEntry.sequenceId + 1 : 1;
-  const previousHash = lastEntry ? lastEntry.currentHash : '0000000000000000000000000000000000000000000000000000000000000000'; // Genesis Hash
+  const previousHash = lastEntry ? lastEntry.currentHash : GENESIS_HASH;
 
   const recordPayload = {
     sequenceId,
@@ -64,9 +89,17 @@ AuditSchema.statics.verifyChainIntegrity = async function () {
     return { valid: true, totalRecords: 0, corruptedSequenceId: null };
   }
 
-  let expectedPreviousHash = '0000000000000000000000000000000000000000000000000000000000000000';
+  let expectedPreviousHash = GENESIS_HASH;
 
-  for (const record of records) {
+  for (const [index, record] of records.entries()) {
+    if (record.sequenceId !== index + 1) {
+      return {
+        valid: false,
+        reason: 'INVALID_SEQUENCE',
+        corruptedSequenceId: record.sequenceId
+      };
+    }
+
     // 1. Verify previous hash pointer matches expected link
     if (record.previousHash !== expectedPreviousHash) {
       return {
@@ -77,7 +110,7 @@ AuditSchema.statics.verifyChainIntegrity = async function () {
     }
 
     // 2. Re-calculate SHA-256 hash of record payload
-    const recalculatedHash = this.calculateHash(record, record.previousHash);
+    const recalculatedHash = this.calculateHash(record.toObject(), record.previousHash);
     if (recalculatedHash !== record.currentHash) {
       return {
         valid: false,

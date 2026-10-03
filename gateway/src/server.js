@@ -19,6 +19,7 @@ const {
 
 const app = Fastify({
   logger: true,
+  trustProxy: process.env.TRUST_PROXY === 'true',
 });
 
 // ======================================================
@@ -30,18 +31,38 @@ const PORT = Number(process.env.PORT) || 8000;
 const UPSTREAM_URL =
   process.env.UPSTREAM_URL || 'http://localhost:5000';
 
-const REDIS_CONFIG = {
-  host: process.env.REDIS_HOST || '127.0.0.1',
+function buildRedisConfig() {
+  const redisUrl = process.env.REDIS_URL?.trim();
+  if (redisUrl) {
+    const parsed = new URL(redisUrl);
+    const config = {
+      host: parsed.hostname,
+      port: Number(parsed.port) || (parsed.protocol === 'rediss:' ? 6380 : 6379),
+      password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+      maxRetriesPerRequest: null,
+    };
 
-  port: Number(process.env.REDIS_PORT) || 6379,
+    if (parsed.username) {
+      config.username = decodeURIComponent(parsed.username);
+    }
+    if (parsed.protocol === 'rediss:') {
+      config.tls = {};
+    }
+    return config;
+  }
 
-  password: process.env.REDIS_PASSWORD || undefined,
+  const config = {
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: Number(process.env.REDIS_PORT) || 6379,
+    password: process.env.REDIS_PASSWORD || undefined,
+    maxRetriesPerRequest: null,
+  };
 
-  tls:
-    process.env.REDIS_TLS === 'true'
-      ? {}
-      : undefined,
-};
+  if (process.env.REDIS_TLS === 'true') {
+    config.tls = {};
+  }
+  return config;
+}
 
 // ======================================================
 // Start Server
@@ -49,6 +70,8 @@ const REDIS_CONFIG = {
 
 const start = async () => {
   try {
+    const REDIS_CONFIG = buildRedisConfig();
+
     // ==================================================
     // CORS
     // ==================================================
@@ -148,7 +171,7 @@ const start = async () => {
 
         // Do not apply security processing to
         // Prometheus metrics.
-        if (url.startsWith('/metrics')) {
+        if (url.split('?')[0] === '/metrics') {
           return;
         }
 
@@ -162,18 +185,7 @@ const start = async () => {
         // Client IP
         // ----------------------------------------------
 
-        let clientIp =
-          req.headers['x-forwarded-for'] ||
-          req.ip ||
-          req.raw.socket?.remoteAddress ||
-          '127.0.0.1';
-
-        if (clientIp.includes(',')) {
-          clientIp = clientIp
-            .split(',')[0]
-            .trim();
-        }
-
+        const clientIp = req.ip || req.raw.socket?.remoteAddress || '127.0.0.1';
         req.clientIp = clientIp;
 
         // ----------------------------------------------
@@ -208,25 +220,19 @@ const start = async () => {
           clientIp
         );
 
-        reply.header(
-          'X-RateLimit-Limit',
-          limit
-        );
-
-        reply.header(
-          'X-RateLimit-Remaining',
-          remaining
-        );
+        if (!reply.sent) {
+          reply.header('X-RateLimit-Limit', limit);
+          reply.header('X-RateLimit-Remaining', remaining);
+        }
 
         if (!allowed) {
           await jailEngine.recordViolation(
             clientIp
           );
 
-          reply.header(
-            'Retry-After',
-            10
-          );
+          if (!reply.sent) {
+            reply.header('Retry-After', 10);
+          }
 
           httpRequestCounter.inc({
             method: req.method,
@@ -333,7 +339,7 @@ const start = async () => {
         const url =
           req.raw.url || req.url;
 
-        if (url.startsWith('/metrics')) {
+        if (url.split('?')[0] === '/metrics') {
           return;
         }
 

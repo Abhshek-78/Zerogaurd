@@ -67,6 +67,7 @@ class SignatureEngine {
 
       // Check SQL Injection
       for (const pattern of this.sqliRegexes) {
+        pattern.lastIndex = 0;
         if (pattern.test(decoded)) {
           return { threatDetected: true, threatType: 'SQL_INJECTION', matchedValue: value };
         }
@@ -74,6 +75,7 @@ class SignatureEngine {
 
       // Check Cross-Site Scripting (XSS)
       for (const pattern of this.xssRegexes) {
+        pattern.lastIndex = 0;
         if (pattern.test(decoded)) {
           return { threatDetected: true, threatType: 'XSS_ATTACK', matchedValue: value };
         }
@@ -81,6 +83,7 @@ class SignatureEngine {
 
       // Check Path Traversal
       for (const pattern of this.pathTraversalRegexes) {
+        pattern.lastIndex = 0;
         if (pattern.test(decoded)) {
           return { threatDetected: true, threatType: 'PATH_TRAVERSAL', matchedValue: value };
         }

@@ -10,10 +10,11 @@ function buildRedisConnection() {
     if (redisUrl.startsWith('rediss://')) {
       return {
         url: redisUrl,
-        tls: { rejectUnauthorized: false }
+        tls: {},
+        maxRetriesPerRequest: null
       };
     }
-    return { url: redisUrl };
+    return { url: redisUrl, maxRetriesPerRequest: null };
   }
 
   let host = (process.env.REDIS_HOST || '127.0.0.1')
@@ -30,7 +31,7 @@ function buildRedisConnection() {
   };
 
   if (process.env.REDIS_TLS === 'true' || host.includes('upstash.io')) {
-    config.tls = { rejectUnauthorized: false };
+    config.tls = {};
   }
 
   return config;
@@ -40,6 +41,17 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/zeroguard_
 
 async function main() {
   console.log('[ZeroGuard Worker] Initializing worker service...');
+
+  const PORT = Number(process.env.PORT) || 10000;
+  const healthServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'healthy', service: 'zeroguard-worker' }));
+  });
+  await new Promise((resolve, reject) => {
+    healthServer.once('error', reject);
+    healthServer.listen(PORT, resolve);
+  });
+  console.log(`[ZeroGuard Worker] Health check endpoint listening on port ${PORT}`);
 
   try {
     await mongoose.connect(MONGO_URI);
@@ -76,18 +88,6 @@ async function main() {
     console.error('[ZeroGuard Worker] BullMQ Engine Error:', err.message);
   });
 
-  // -------------------------------------------------------------
-  // DUMMY HEALTH-CHECK HTTP SERVER FOR RENDER PORT SCAN
-  // -------------------------------------------------------------
-  const PORT = process.env.PORT || 10000;
-  const healthServer = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'healthy', service: 'zeroguard-worker' }));
-  });
-
-  healthServer.listen(PORT, () => {
-    console.log(`[ZeroGuard Worker] Health check endpoint listening on port ${PORT}`);
-  });
 }
 
 main().catch((err) => {

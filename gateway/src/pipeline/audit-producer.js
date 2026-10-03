@@ -4,7 +4,10 @@ class AuditProducer {
   constructor(redisOptions) {
     // Queue name for proxy audit events
     this.auditQueue = new Queue('audit-events', {
-      connection: redisOptions,
+      connection: {
+        ...redisOptions,
+        maxRetriesPerRequest: null
+      },
       defaultJobOptions: {
         attempts: 3, // Retry 3 times on failure
         backoff: {
@@ -14,6 +17,10 @@ class AuditProducer {
         removeOnComplete: true, // Keep Redis memory clean
         removeOnFail: 1000     // Keep last 1000 failed logs for inspection
       }
+    });
+
+    this.auditQueue.on('error', (err) => {
+      console.error('[AuditProducer Error] Queue connection error:', err);
     });
   }
 
